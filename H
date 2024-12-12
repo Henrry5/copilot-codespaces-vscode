@@ -1,0 +1,357 @@
+import sys
+import os
+import logging
+import cv2
+from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout, 
+                               QWidget, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
+                               QGroupBox, QGridLayout, QHeaderView)
+from PySide6.QtGui import QPixmap, QImage, QFont
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from ultralytics import YOLO
+
+class VideoThread(QThread):
+    change_pixmap_signal = Signal(QImage)
+    detection_signal = Signal(list)
+    
+    def __init__(self, source):
+        super().__init__()
+        self.source = source
+        self.model = YOLO('yolov8n.pt')
+        self.running = True
+
+    def run(self):
+        if isinstance(self.source, str) and os.path.isfile(self.source):
+            self.process_file(self.source)
+        elif isinstance(self.source, list):
+            for file in self.source:
+                if self.running:
+                    self.process_file(file)
+        else:
+            self.process_stream(self.source)
+
+    def process_file(self, file_path):
+        if not self.file_exists(file_path):
+            logging.error(f"File not found: {file_path}")
+            self.detection_signal.emit([{'error': f"File not found: {file_path}"}])
+            return
+
+        if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+            try:
+                frame = cv2.imread(file_path)
+                if frame is None:
+                    raise ValueError(f"Failed to read image: {file_path}")
+                self.process_frame(frame)
+            except Exception as e:
+                logging.error(f"Error processing image {file_path}: {str(e)}")
+                self.detection_signal.emit([{'error': f"Error processing image: {str(e)}"}])
+        elif file_path.lower().endswith(('.mp4', '.avi', '.mov')):
+            try:
+                cap = cv2.VideoCapture(file_path)
+                if not cap.isOpened():
+                    raise ValueError(f"Failed to open video: {file_path}")
+                while self.running:
+                    ret, frame = cap.read()
+                    if ret:
+                        self.process_frame(frame)
+                    else:
+                        break
+                cap.release()
+            except Exception as e:
+                logging.error(f"Error processing video {file_path}: {str(e)}")
+                self.detection_signal.emit([{'error': f"Error processing video: {str(e)}"}])
+        else:
+            logging.error(f"Unsupported file format: {file_path}")
+            self.detection_signal.emit([{'error': f"Unsupported file format: {file_path}"}])
+
+    def process_stream(self, stream):
+        cap = cv2.VideoCapture(stream)
+        while self.running:
+            ret, frame = cap.read()
+            if ret:
+                self.process_frame(frame)
+            else:
+                break
+        cap.release()
+
+    def process_frame(self, frame):
+        results = self.model(frame, classes=[2, 3, 5, 7])  # 只检测车辆相关类别
+        annotated_frame = results[0].plot()
+        rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        scaled_image = qt_image.scaled(800, 600, Qt.KeepAspectRatio)
+        self.change_pixmap_signal.emit(scaled_image)
+        
+        detections = []
+        for i, det in enumerate(results[0].boxes.data):
+            x1, y1, x2, y2, conf, cls = det
+            detections.append({
+                'id': i + 1,
+                'class': results[0].names[int(cls)],
+                'confidence': float(conf),
+                'position': [int(x1), int(y1), int(x2), int(y2)]
+            })
+        self.detection_signal.emit(detections)
+
+    def stop(self):
+        self.running = False
+
+    def file_exists(self, file_path):
+        return os.path.isfile(file_path)
+
+class VehicleDetectionUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("基于YOLOv8深度学习的车辆检测系统")
+        self.setGeometry(100, 100, 1200, 800)
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f0f0f0;
+            }
+            QLabel {
+                font-size: 14px;
+            }
+            QPushButton {
+                font-size: 14px;
+                padding: 8px 15px;
+                background-color: #4a90e2;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #357abd;
+            }
+            QGroupBox {
+                font-size: 14px;
+                border: 2px solid #dcdcdc;
+                border-radius: 6px;
+                margin-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QTableWidget {
+                border: 1px solid #dcdcdc;
+                gridline-color: #dcdcdc;
+            }
+            QHeaderView::section {
+                background-color: #e1e1e1;
+                padding: 4px;
+                border: 1px solid #dcdcdc;
+                font-size: 14px;
+            }
+        """)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QHBoxLayout(central_widget)
+        
+        left_layout = QVBoxLayout()
+        
+        self.image_label = QLabel()
+        self.image_label.setFixedSize(800, 600)
+        self.image_label.setStyleSheet("border: 2px solid #dcdcdc; border-radius: 8px;")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        left_layout.addWidget(self.image_label)
+        
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(5)
+        self.result_table.setHorizontalHeaderLabels(['序号', '文件路径', '类别', '置信度', '坐标位置'])
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        left_layout.addWidget(self.result_table)
+        
+        right_layout = QVBoxLayout()
+        
+        file_group = QGroupBox("文件导入")
+        file_layout = QVBoxLayout()
+        self.select_image_btn = QPushButton("选择图片")
+        self.select_video_btn = QPushButton("选择视频")
+        self.select_folder_btn = QPushButton("选择文件夹")
+        self.start_camera_btn = QPushButton("摄像头开启")
+        file_layout.addWidget(self.select_image_btn)
+        file_layout.addWidget(self.select_video_btn)
+        file_layout.addWidget(self.select_folder_btn)
+        file_layout.addWidget(self.start_camera_btn)
+        file_group.setLayout(file_layout)
+        
+        detection_group = QGroupBox("检测结果")
+        detection_layout = QGridLayout()
+        detection_layout.addWidget(QLabel("用时:"), 0, 0)
+        self.time_label = QLabel("0.000 s")
+        detection_layout.addWidget(self.time_label, 0, 1)
+        detection_layout.addWidget(QLabel("目标数目:"), 1, 0)
+        self.object_count_label = QLabel("0")
+        detection_layout.addWidget(self.object_count_label, 1, 1)
+        detection_group.setLayout(detection_layout)
+        
+        operation_group = QGroupBox("操作")
+        operation_layout = QHBoxLayout()
+        self.save_btn = QPushButton("保存")
+        self.exit_btn = QPushButton("退出")
+        operation_layout.addWidget(self.save_btn)
+        operation_layout.addWidget(self.exit_btn)
+        operation_group.setLayout(operation_layout)
+        
+        right_layout.addWidget(file_group)
+        right_layout.addWidget(detection_group)
+        right_layout.addWidget(operation_group)
+        right_layout.addStretch()
+        
+        main_layout.addLayout(left_layout, 7)
+        main_layout.addLayout(right_layout, 3)
+        
+        self.select_image_btn.clicked.connect(self.select_image)
+        self.select_video_btn.clicked.connect(self.select_video)
+        self.select_folder_btn.clicked.connect(self.select_folder)
+        self.start_camera_btn.clicked.connect(self.toggle_camera)
+        self.save_btn.clicked.connect(self.save_results)
+        self.exit_btn.clicked.connect(self.close)
+        
+        self.thread = None
+        self.camera_active = False
+        self.current_file = ""
+        self.carousel_timer = QTimer(self)
+        self.carousel_timer.timeout.connect(self.next_carousel_image)
+        self.carousel_images = []
+        self.current_carousel_index = 0
+        
+    def select_image(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "图片文件 (*.jpg *.jpeg *.png *.bmp)")
+        if file_name:
+            self.current_file = file_name
+            self.process_image(file_name)
+            
+    def select_video(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择视频", "", "视频文件 (*.mp4 *.avi *.mov)")
+        if file_name:
+            self.current_file = file_name
+            self.start_video_detection(file_name)
+            
+    def select_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
+        if folder_path:
+            self.process_folder(folder_path)
+        else:
+            self.update_results([{'error': f"No folder selected"}])
+
+    def toggle_camera(self):
+        if not self.camera_active:
+            self.start_camera()
+            self.start_camera_btn.setText("关闭摄像头")
+        else:
+            self.stop_detection()
+            self.start_camera_btn.setText("摄像头开启")
+        self.camera_active = not self.camera_active
+            
+    def process_image(self, image_path):
+        if self.thread is not None:
+            self.stop_detection()
+        self.thread = VideoThread(image_path)
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.detection_signal.connect(self.update_results)
+        self.thread.start()
+        
+    def start_video_detection(self, video_path):
+        if self.thread is not None:
+            self.stop_detection()
+        self.thread = VideoThread(video_path)
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.detection_signal.connect(self.update_results)
+        self.thread.start()
+        
+    def process_folder(self, folder_path):
+        image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
+                       if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+        if image_files:
+            if self.thread is not None:
+                self.stop_detection()
+            self.thread = VideoThread(image_files)
+            self.thread.change_pixmap_signal.connect(self.update_image)
+            self.thread.detection_signal.connect(self.update_results)
+            self.thread.start()
+            self.start_carousel()
+        else:
+            self.update_results([{'error': f"No supported image files found in folder: {folder_path}"}])
+        
+    def start_camera(self):
+        if self.thread is not None:
+            self.stop_detection()
+        self.thread = VideoThread(0)  # 0 表示默认摄像头
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.detection_signal.connect(self.update_results)
+        self.thread.start()
+        
+    def stop_detection(self):
+        if self.thread is not None:
+            self.thread.stop()
+            self.thread.wait()
+            self.thread = None
+        self.carousel_timer.stop()
+        self.carousel_images.clear()
+            
+    def update_image(self, image):
+        self.carousel_images.append(image)
+        self.image_label.setPixmap(QPixmap.fromImage(image))
+        
+    def update_results(self, detections):
+        self.result_table.setRowCount(len(detections))
+        for i, det in enumerate(detections):
+            if 'error' in det:
+                self.result_table.setRowCount(1)
+                self.result_table.setItem(0, 0, QTableWidgetItem("Error"))
+                self.result_table.setItem(0, 1, QTableWidgetItem(det['error']))
+                self.result_table.setItem(0, 2, QTableWidgetItem(""))
+                self.result_table.setItem(0, 3, QTableWidgetItem(""))
+                self.result_table.setItem(0, 4, QTableWidgetItem(""))
+                self.object_count_label.setText("0")
+                return
+
+            self.result_table.setItem(i, 0, QTableWidgetItem(str(det['id'])))
+            self.result_table.setItem(i, 1, QTableWidgetItem(self.current_file))
+            self.result_table.setItem(i, 2, QTableWidgetItem(det['class']))
+            self.result_table.setItem(i, 3, QTableWidgetItem(f"{det['confidence']:.2%}"))
+            self.result_table.setItem(i, 4, QTableWidgetItem(str(det['position'])))
+            
+        self.object_count_label.setText(str(len(detections)))
+        
+    def save_results(self):
+        if not self.result_table.rowCount():
+            return
+            
+        file_name, _ = QFileDialog.getSaveFileName(self, "保存结果", "", "CSV文件 (*.csv)")
+        if file_name:
+            with open(file_name, 'w', encoding='utf-8') as f:
+                f.write("序号,文件路径,类别,置信度,坐标位置\n")
+                for row in range(self.result_table.rowCount()):
+                    row_data = []
+                    for col in range(self.result_table.columnCount()):
+                        item = self.result_table.item(row, col)
+                        row_data.append(item.text() if item else "")
+                    f.write(",".join(row_data) + "\n")
+                    
+    def start_carousel(self):
+        if self.carousel_images:
+            self.current_carousel_index = 0
+            self.carousel_timer.start(3000)  # 每3秒切换一次图片
+
+    def next_carousel_image(self):
+        if self.carousel_images:
+            self.current_carousel_index = (self.current_carousel_index + 1) % len(self.carousel_images)
+            self.image_label.setPixmap(QPixmap.fromImage(self.carousel_images[self.current_carousel_index]))
+                    
+    def closeEvent(self, event):
+        self.stop_detection()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = VehicleDetectionUI()
+    window.show()
+    sys.exit(app.exec())
+
